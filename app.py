@@ -2,7 +2,7 @@ import io
 import numpy as np
 import tensorflow as tf
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter
 
 app = FastAPI()
 
@@ -26,30 +26,31 @@ def build_model():  # misma arquitectura usada en el entrenamiento
 model = build_model()
 
 
-def otsu(a):  # umbral automatico para separar tinta y papel
+def otsu(a):
     hist = np.bincount(a.astype(np.uint8).ravel(), minlength=256).astype(float)
-    p = hist / hist.sum()
-    w = np.cumsum(p)
-    mu = np.cumsum(p * np.arange(256))
-    sb = (mu[-1] * w - mu) ** 2 / (w * (1 - w) + 1e-12)
-    return np.argmax(sb)
-
+    p = hist / hist.sum(); w = np.cumsum(p); mu = np.cumsum(p * np.arange(256))
+    return np.argmax((mu[-1] * w - mu) ** 2 / (w * (1 - w) + 1e-12))
 
 def preprocesar(img):
-    """Convierte una foto (digito oscuro sobre papel claro) al formato MNIST 28x28."""
+    """Convierte una foto (digito escrito sobre papel) al formato MNIST 28x28."""
     img = ImageOps.exif_transpose(img).convert("L")
     img.thumbnail((300, 300))
-    a = np.asarray(img, np.float32)
-    if a.mean() > 127:  # papel blanco -> invertir (MNIST es trazo blanco sobre negro)
-        a = 255 - a
-    a = np.where(a > otsu(a), a, 0)
-    filas = np.where((a > 0).sum(1) > 0.02 * a.shape[1])[0]
-    cols = np.where((a > 0).sum(0) > 0.02 * a.shape[0])[0]
+    fondo = img.filter(ImageFilter.GaussianBlur(max(img.size) / 12))  # iluminacion del papel
+    a, f = np.asarray(img, np.float32), np.asarray(fondo, np.float32)
+    oscuro, claro = np.clip(f - a, 0, None), np.clip(a - f, 0, None)
+    a = oscuro if oscuro.sum() >= claro.sum() else claro  # trazo oscuro sobre papel claro (o al reves)
+    a = a / (a.max() + 1e-6) * 255
+    a = np.where(a > max(otsu(a), 40), a, 0)
+    m = max(2, int(0.03 * min(a.shape))); a[:m], a[-m:], a[:, :m], a[:, -m:] = 0, 0, 0, 0  # ignora bordes
+    filas = np.where((a > 0).sum(1) > 0.01 * a.shape[1])[0]
+    cols = np.where((a > 0).sum(0) > 0.01 * a.shape[0])[0]
     if len(filas) and len(cols):
         a = a[filas[0]:filas[-1] + 1, cols[0]:cols[-1] + 1]
+    a = np.where(a > 0, 255, 0).astype(np.uint8)
     h, w = a.shape
-    s = 20.0 / max(h, w)  # el digito ocupa 20x20 dentro de 28x28, como en MNIST
-    d = Image.fromarray(a.astype(np.uint8)).resize((max(1, round(w * s)), max(1, round(h * s))))
+    s = 20.0 / max(h, w)
+    d = Image.fromarray(a)
+    d = d.resize((max(1, round(w * s)), max(1, round(h * s))), Image.LANCZOS)
     lienzo = Image.new("L", (28, 28))
     lienzo.paste(d, ((28 - d.width) // 2, (28 - d.height) // 2))
     return np.asarray(lienzo, np.float32).reshape(1, 28, 28, 1) / 255.0
